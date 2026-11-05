@@ -1,1 +1,31 @@
-
+{
+  "name": "HDHub4u",
+  "version": "1.1.0",
+  "description": "HDHub4u streams for movies and TV series (Hindi/Dual Audio focused) - Refactored with HTML search fallback",
+  "author": "Custom",
+  "scrapers": [
+    {
+      "id": "hdhub4u",
+      "name": "HDHub4u",
+      "description": "Movies & Series from HDHub4u mirrors (480p\u20134K, Dual Audio) - Robust search + mirror failover",
+      "version": "1.1.0",
+      "author": "Custom",
+      "supportedTypes": [
+        "movie",
+        "tv"
+      ],
+      "filename": "providers/hdhub4u.js",
+      "enabled": true,
+      "formats": [
+        "mkv",
+        "mp4",
+        "m3u8"
+      ],
+      "logo": "https://www.google.com/s2/favicons?domain=hdhub4u.cl&sz=128",
+      "contentLanguage": [
+        "hi",
+        "en"
+      ]
+    }
+  ]
+}
