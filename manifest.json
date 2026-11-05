@@ -1,14 +1,14 @@
 {
   "name": "HDHub4u",
-  "version": "1.1.0",
-  "description": "HDHub4u streams for movies and TV series (Hindi/Dual Audio focused) - Refactored with HTML search fallback",
+  "version": "1.2.0",
+  "description": "HDHub4u streams - HubCloud resolver + HTML search fallback",
   "author": "Custom",
   "scrapers": [
     {
       "id": "hdhub4u",
       "name": "HDHub4u",
-      "description": "Movies & Series from HDHub4u mirrors (480p\u20134K, Dual Audio) - Robust search + mirror failover",
-      "version": "1.1.0",
+      "description": "Movies & Series from HDHub4u (HubCloud resolved, dual audio)",
+      "version": "1.2.0",
       "author": "Custom",
       "supportedTypes": [
         "movie",
