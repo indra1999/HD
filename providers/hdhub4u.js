@@ -1,8 +1,8 @@
 /**
- * HDHub4u Provider for Nuvio (Refactored)
- * - HTML search fallback (Typesense API is currently Cloudflare-blocked)
+ * HDHub4u Provider for Nuvio (v1.2.0)
+ * - HTML search fallback
+ * - HubCloud / intermediate link resolver
  * - Updated mirrors + auto failover
- * - Better logging & link extraction
  * Exports: getStreams(tmdbId, mediaType, season, episode)
  */
 
@@ -31,7 +31,6 @@ var MIRRORS = [
   "https://hdhub4u13.com"
 ];
 
-// Typesense is currently 403'd by Cloudflare – kept only as optional primary
 var SEARCH_API = "https://search.hdhub4u.glass/collections/post/documents/search";
 var TMDB_API_KEY = "439c478a771f35c05022f9feabcca01c";
 var TMDB_BASE = "https://api.themoviedb.org/3";
@@ -96,6 +95,18 @@ function sizeFromText(text) {
   return m[1] + " " + m[2].toUpperCase();
 }
 
+function getCheerio() {
+  try {
+    return require("cheerio-without-node-native");
+  } catch (e) {
+    try {
+      return require("cheerio");
+    } catch (e2) {
+      return null;
+    }
+  }
+}
+
 // ─── TMDB ────────────────────────────────────────────────────────────────────
 function getTMDBDetails(tmdbId, mediaType) {
   return __async(this, null, function* () {
@@ -115,13 +126,8 @@ function getTMDBDetails(tmdbId, mediaType) {
 }
 
 // ─── Search ──────────────────────────────────────────────────────────────────
-/**
- * Primary: try Typesense (may 403)
- * Fallback: HTML search page on current / working mirror
- */
 function searchPosts(query) {
   return __async(this, null, function* () {
-    // 1) Try Typesense first (fast when it works)
     try {
       var today = new Date().toISOString().split("T")[0];
       var apiUrl = SEARCH_API +
@@ -140,22 +146,15 @@ function searchPosts(query) {
             var year = yearMatch ? parseInt(yearMatch[1] || yearMatch[2], 10) : null;
             var link = doc.permalink || "";
             if (link && link.charAt(0) === "/") link = currentBase + link;
-            return {
-              title: title,
-              url: link,
-              poster: doc.post_thumbnail || null,
-              year: year
-            };
+            return { title: title, url: link, poster: doc.post_thumbnail || null, year: year };
           });
         }
       } else {
-        console.log("[HDHub4u] Typesense status:", apiRes.status, "→ falling back to HTML search");
+        console.log("[HDHub4u] Typesense status:", apiRes.status, "→ HTML fallback");
       }
     } catch (e) {
       console.log("[HDHub4u] Typesense error:", e && e.message ? e.message : e);
     }
-
-    // 2) HTML search fallback across mirrors
     return yield searchPostsHtml(query);
   });
 }
@@ -164,7 +163,7 @@ function searchPostsHtml(query) {
   return __async(this, null, function* () {
     var cheerio = getCheerio();
     if (!cheerio) {
-      console.log("[HDHub4u] No cheerio available for HTML search");
+      console.log("[HDHub4u] No cheerio available");
       return [];
     }
 
@@ -178,30 +177,22 @@ function searchPostsHtml(query) {
           headers: Object.assign({}, HEADERS, { Referer: base + "/" }),
           redirect: "follow"
         });
-
-        if (!res.ok) {
-          console.log("[HDHub4u] Mirror", base, "status", res.status);
-          continue;
-        }
+        if (!res.ok) continue;
 
         var html = yield res.text();
-
-        // Cloudflare / challenge page detection
         if (
           html.indexOf("cf-browser-verification") !== -1 ||
           html.indexOf("challenge-platform") !== -1 ||
           html.indexOf("Just a moment") !== -1 ||
           html.length < 2000
         ) {
-          console.log("[HDHub4u] Challenge / blocked page on", base);
+          console.log("[HDHub4u] Challenge page on", base);
           continue;
         }
 
         var $ = cheerio.load(html);
         var results = [];
         var seen = {};
-
-        // Multiple selector strategies (site layout changes often)
         var selectors = [
           "article h2 a, article h3 a",
           ".post-title a, .entry-title a",
@@ -219,7 +210,6 @@ function searchPostsHtml(query) {
             if (href.indexOf("javascript:") === 0) return;
             if (seen[href]) return;
 
-            // Filter obvious non-content links
             var lowerHref = href.toLowerCase();
             if (
               lowerHref.indexOf("/category/") !== -1 ||
@@ -230,12 +220,9 @@ function searchPostsHtml(query) {
               lowerHref === base
             ) return;
 
-            // Prefer links that look like movie/series posts
-            var lowerText = text.toLowerCase();
             var looksLikeContent =
               /\b(20\d{2}|19\d{2})\b/.test(text) ||
-              /season|s\d{1,2}|episode|dual|audio|web-dl|bluray|hdrip|1080|720|480|4k/i.test(text) ||
-              lowerHref.indexOf(base.replace("https://", "").split(".")[0]) !== -1;
+              /season|s\d{1,2}|episode|dual|audio|web-dl|bluray|hdrip|1080|720|480|4k/i.test(text);
 
             if (!looksLikeContent && s < selectors.length - 1) return;
 
@@ -243,18 +230,12 @@ function searchPostsHtml(query) {
             var absUrl = href.indexOf("http") === 0 ? href : (base + (href.charAt(0) === "/" ? href : "/" + href));
             var yearMatch = text.match(/\((\d{4})\)|\b(20\d{2}|19\d{2})\b/);
             var year = yearMatch ? parseInt(yearMatch[1] || yearMatch[2], 10) : null;
-
-            results.push({
-              title: text,
-              url: absUrl,
-              poster: null,
-              year: year
-            });
+            results.push({ title: text, url: absUrl, poster: null, year: year });
           });
         }
 
         if (results.length) {
-          currentBase = base; // remember working mirror
+          currentBase = base;
           console.log("[HDHub4u] HTML search found", results.length, "on", base);
           return results;
         }
@@ -262,8 +243,6 @@ function searchPostsHtml(query) {
         console.log("[HDHub4u] HTML search error on", base, ":", err && err.message ? err.message : err);
       }
     }
-
-    console.log("[HDHub4u] All HTML search attempts failed");
     return [];
   });
 }
@@ -303,31 +282,15 @@ function findBestMatch(mediaInfo, results, mediaType, season) {
   return best;
 }
 
-// ─── Page parsing & extractors ───────────────────────────────────────────────
-function getCheerio() {
-  try {
-    return require("cheerio-without-node-native");
-  } catch (e) {
-    try {
-      return require("cheerio");
-    } catch (e2) {
-      return null;
-    }
-  }
-}
-
+// ─── Page parsing ────────────────────────────────────────────────────────────
 function extractPageLinks(html, pageUrl) {
   var cheerio = getCheerio();
-  if (!cheerio) {
-    console.log("[HDHub4u] cheerio unavailable – cannot extract links");
-    return [];
-  }
+  if (!cheerio) return [];
 
   var $ = cheerio.load(html);
   var links = [];
   var seen = {};
 
-  // Quality heading links + body download links
   $("h3 a, h4 a, h2 a, .page-body a, .entry-content a, .post-content a, a").each(function (i, el) {
     var href = $(el).attr("href");
     var text = ($(el).text() || "").trim();
@@ -352,7 +315,6 @@ function extractPageLinks(html, pageUrl) {
     if (seen[href]) return;
     seen[href] = true;
 
-    // Make absolute if needed
     var abs = href;
     if (href.indexOf("http") !== 0) {
       try {
@@ -374,16 +336,158 @@ function extractPageLinks(html, pageUrl) {
   return links;
 }
 
-function resolveRedirect(url) {
+// ─── HubCloud Resolver (core fix) ────────────────────────────────────────────
+function resolveHubCloud(url, referer) {
   return __async(this, null, function* () {
+    var cheerio = getCheerio();
+    if (!cheerio) return [];
+
     try {
-      var res = yield fetch(url, {
-        headers: Object.assign({}, HEADERS, { Referer: currentBase + "/" }),
+      var currentUrl = url.replace("hubcloud.ink", "hubcloud.dad");
+      console.log("[HDHub4u] Resolving HubCloud:", currentUrl);
+
+      var res = yield fetch(currentUrl, {
+        headers: Object.assign({}, HEADERS, { Referer: referer || currentBase + "/" }),
         redirect: "follow"
       });
-      return res.url || url;
+      var html = yield res.text();
+      var finalUrl = res.url || currentUrl;
+
+      // Step 1: if not already on hubcloud.php, find next hop
+      if (finalUrl.indexOf("hubcloud.php") === -1 && html.indexOf("hubcloud.php") === -1) {
+        var $1 = cheerio.load(html);
+        var nextHref = "";
+
+        var downloadBtn = $1("#download").attr("href") || $1("a#download").attr("href");
+        if (downloadBtn) {
+          nextHref = downloadBtn;
+        } else {
+          var scriptMatch = html.match(/var\s+url\s*=\s*['"]([^'"]+)['"]/);
+          if (scriptMatch) nextHref = scriptMatch[1];
+        }
+
+        if (nextHref) {
+          if (nextHref.indexOf("http") !== 0) {
+            try {
+              nextHref = new URL(nextHref, finalUrl).href;
+            } catch (e) {
+              nextHref = finalUrl.replace(/\/[^/]*$/, "/") + nextHref.replace(/^\//, "");
+            }
+          }
+          console.log("[HDHub4u] HubCloud next hop:", nextHref);
+          var res2 = yield fetch(nextHref, {
+            headers: Object.assign({}, HEADERS, { Referer: finalUrl }),
+            redirect: "follow"
+          });
+          html = yield res2.text();
+          finalUrl = res2.url || nextHref;
+        }
+      }
+
+      var $ = cheerio.load(html);
+      var sizeText = ($("i#size").text() || "").trim();
+      var headerText = ($("div.card-header").text() || $("title").text() || "").trim();
+      var quality = qualityFromText(headerText + " " + sizeText);
+      var size = sizeFromText(sizeText) || sizeFromText(headerText);
+
+      var results = [];
+      var seen = {};
+
+      $("a.btn, a[href], .btn a").each(function (i, el) {
+        var link = $(el).attr("href");
+        var text = ($(el).text() || "").toLowerCase().trim();
+        if (!link || seen[link]) return;
+
+        // Skip non-useful links
+        if (link.indexOf("javascript:") === 0) return;
+        if (link === "#" || link.indexOf("telegram") !== -1 || link.indexOf("whatsapp") !== -1) return;
+
+        var isUseful =
+          text.indexOf("download") !== -1 ||
+          text.indexOf("fsl") !== -1 ||
+          text.indexOf("s3") !== -1 ||
+          text.indexOf("buzz") !== -1 ||
+          text.indexOf("10gbps") !== -1 ||
+          text.indexOf("mega") !== -1 ||
+          text.indexOf("pixel") !== -1 ||
+          text.indexOf("gofile") !== -1 ||
+          text.indexOf("zipdisk") !== -1 ||
+          link.indexOf("workers.dev") !== -1 ||
+          link.indexOf("r2.dev") !== -1 ||
+          link.indexOf("pixeldrain") !== -1 ||
+          link.indexOf("gofile") !== -1 ||
+          link.indexOf("hubcloud") !== -1 ||
+          /\.(mkv|mp4|avi|m3u8)(\?|$)/i.test(link);
+
+        if (!isUseful) return;
+        seen[link] = true;
+
+        var absLink = link;
+        if (link.indexOf("http") !== 0) {
+          try {
+            absLink = new URL(link, finalUrl).href;
+          } catch (e) {
+            absLink = link;
+          }
+        }
+
+        var label = "HubCloud";
+        if (text.indexOf("fsl") !== -1) label = "HubCloud FSL";
+        else if (text.indexOf("s3") !== -1) label = "HubCloud S3";
+        else if (text.indexOf("buzz") !== -1) label = "HubCloud Buzz";
+        else if (text.indexOf("10gbps") !== -1) label = "HubCloud 10Gbps";
+        else if (text.indexOf("mega") !== -1) label = "HubCloud Mega";
+        else if (text.indexOf("pixel") !== -1 || absLink.indexOf("pixeldrain") !== -1) label = "Pixeldrain";
+        else if (text.indexOf("gofile") !== -1 || absLink.indexOf("gofile") !== -1) label = "Gofile";
+        else if (absLink.indexOf("workers.dev") !== -1) label = "Workers";
+
+        results.push({
+          url: absLink,
+          name: label + (size ? " • " + size : ""),
+          quality: quality,
+          size: size
+        });
+      });
+
+      console.log("[HDHub4u] HubCloud resolved:", results.length, "links");
+      return results;
+    } catch (err) {
+      console.log("[HDHub4u] HubCloud resolve error:", err && err.message ? err.message : err);
+      return [];
+    }
+  });
+}
+
+function resolveLink(url, referer) {
+  return __async(this, null, function* () {
+    var lower = (url || "").toLowerCase();
+
+    // Already looks like direct file
+    if (/\.(mkv|mp4|avi|m3u8)(\?|$)/i.test(url) || lower.indexOf("workers.dev") !== -1 || lower.indexOf("r2.dev") !== -1) {
+      return [{ url: url, name: "Direct", quality: "Unknown", size: null }];
+    }
+
+    // HubCloud family
+    if (lower.indexOf("hubcloud") !== -1 || lower.indexOf("hubcdn") !== -1) {
+      return yield resolveHubCloud(url, referer);
+    }
+
+    // Simple redirect follow for other intermediate hosts
+    try {
+      var res = yield fetch(url, {
+        headers: Object.assign({}, HEADERS, { Referer: referer || currentBase + "/" }),
+        redirect: "follow"
+      });
+      var final = res.url || url;
+
+      // If final is still intermediate, try HubCloud logic
+      if (final.toLowerCase().indexOf("hubcloud") !== -1) {
+        return yield resolveHubCloud(final, url);
+      }
+
+      return [{ url: final, name: "Resolved", quality: "Unknown", size: null }];
     } catch (e) {
-      return url;
+      return [{ url: url, name: "Original", quality: "Unknown", size: null }];
     }
   });
 }
@@ -426,7 +530,6 @@ function getStreams(tmdbId, mediaType, season, episode) {
 
       var results = yield searchPosts(query);
       if (!results.length) {
-        // fallback: title only
         results = yield searchPosts(mediaInfo.title);
       }
       console.log("[HDHub4u] Search results:", results.length);
@@ -434,12 +537,11 @@ function getStreams(tmdbId, mediaType, season, episode) {
 
       var match = findBestMatch(mediaInfo, results, type, season);
       if (!match || !match.url) {
-        console.log("[HDHub4u] No good match found");
+        console.log("[HDHub4u] No good match");
         return [];
       }
       console.log("[HDHub4u] Best match:", match.title, "→", match.url);
 
-      // Ensure absolute URL on current base
       var pageUrl = match.url;
       if (pageUrl.indexOf("http") !== 0) {
         pageUrl = currentBase + (pageUrl.charAt(0) === "/" ? pageUrl : "/" + pageUrl);
@@ -450,11 +552,9 @@ function getStreams(tmdbId, mediaType, season, episode) {
       });
 
       if (!pageRes.ok) {
-        // try next mirrors quickly
         for (var mi = 0; mi < Math.min(MIRRORS.length, 5); mi++) {
           var tryBase = MIRRORS[mi];
           var altUrl = pageUrl.replace(/https?:\/\/[^/]+/, tryBase);
-          console.log("[HDHub4u] Trying mirror page:", altUrl);
           pageRes = yield fetch(altUrl, {
             headers: Object.assign({}, HEADERS, { Referer: tryBase + "/" })
           });
@@ -466,14 +566,14 @@ function getStreams(tmdbId, mediaType, season, episode) {
         }
       }
       if (!pageRes.ok) {
-        console.log("[HDHub4u] Page fetch failed on all mirrors");
+        console.log("[HDHub4u] Page fetch failed");
         return [];
       }
 
       var html = yield pageRes.text();
       var rawLinks = extractPageLinks(html, pageUrl);
       if (!rawLinks.length) {
-        console.log("[HDHub4u] No download links found on page");
+        console.log("[HDHub4u] No links on page");
         return [];
       }
 
@@ -482,32 +582,25 @@ function getStreams(tmdbId, mediaType, season, episode) {
 
       for (var i = 0; i < rawLinks.length; i++) {
         var L = rawLinks[i];
-        var finalUrl = L.url;
+        try {
+          var resolved = yield resolveLink(L.url, pageUrl);
+          for (var j = 0; j < resolved.length; j++) {
+            var R = resolved[j];
+            if (!R.url || seenFinal[R.url]) continue;
+            seenFinal[R.url] = true;
 
-        // light resolve for intermediate short links
-        if (
-          finalUrl.indexOf("hdhub4u") !== -1 ||
-          finalUrl.indexOf("hubcloud") !== -1 ||
-          finalUrl.indexOf("hdstream") !== -1 ||
-          finalUrl.indexOf("hblinks") !== -1
-        ) {
-          try {
-            finalUrl = yield resolveRedirect(finalUrl);
-          } catch (e) {}
+            streams.push(buildStreamObject({
+              url: R.url,
+              name: R.name || L.name,
+              quality: R.quality !== "Unknown" ? R.quality : L.quality,
+              size: R.size || L.size
+            }, mediaInfo));
+          }
+        } catch (e) {
+          console.log("[HDHub4u] resolve error:", e && e.message ? e.message : e);
         }
-
-        if (seenFinal[finalUrl]) continue;
-        seenFinal[finalUrl] = true;
-
-        streams.push(buildStreamObject({
-          url: finalUrl,
-          name: L.name,
-          quality: L.quality,
-          size: L.size
-        }, mediaInfo));
       }
 
-      // Prefer higher quality first
       streams.sort(function (a, b) {
         var order = { "4K": 4, "1080p": 3, "720p": 2, "480p": 1, "Unknown": 0 };
         return (order[b.quality] || 0) - (order[a.quality] || 0);
@@ -523,4 +616,3 @@ function getStreams(tmdbId, mediaType, season, episode) {
 }
 
 module.exports = { getStreams };
-
