@@ -1,8 +1,11 @@
 /**
- * HDHub4u Provider for Nuvio (v1.2.0)
+ * HDHub4u Provider for Nuvio (v1.2.1)
  * - HTML search fallback
  * - HubCloud / intermediate link resolver
  * - Updated mirrors + auto failover
+ * - Fixes: normalizeTitle order/Unicode, season boundary match, episode filter,
+ *   fetch timeout, parallel resolve, quality word-boundary, score threshold config,
+ *   mediaType normalize, safer TMDB key handling
  * Exports: getStreams(tmdbId, mediaType, season, episode)
  */
 
@@ -32,8 +35,13 @@ var MIRRORS = [
 ];
 
 var SEARCH_API = "https://search.hdhub4u.glass/collections/post/documents/search";
-var TMDB_API_KEY = "439c478a771f35c05022f9feabcca01c";
+// Do not hardcode API keys. Prefer environment variable when available.
+var TMDB_API_KEY = (typeof process !== "undefined" && process.env && process.env.TMDB_API_KEY) || "";
 var TMDB_BASE = "https://api.themoviedb.org/3";
+
+var MATCH_SCORE_THRESHOLD = 0.35;
+var FETCH_TIMEOUT_MS = 10000;
+var RESOLVE_CONCURRENCY = 4;
 
 var HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -51,11 +59,12 @@ var currentBase = MIRRORS[0];
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 function normalizeTitle(t) {
   if (!t) return "";
+  // Order: strip articles → punctuation → collapse whitespace last
+  // Avoid [^\w\s] which drops non-Latin scripts (Bengali, Hindi, etc.)
   return t.toLowerCase()
     .replace(/\b(the|a|an)\b/g, "")
-    .replace(/[:\-_']/g, " ")
+    .replace(/[:\-_'`~!@#$%^&*()+=\[\]{};:"\\|,.<>\/?]+/g, " ")
     .replace(/\s+/g, " ")
-    .replace(/[^\w\s]/g, "")
     .trim();
 }
 
@@ -73,18 +82,18 @@ function titleSimilarity(a, b) {
   var union = {};
   for (var k = 0; k < w1.length; k++) union[w1[k]] = true;
   for (var m = 0; m < w2.length; m++) union[w2[m]] = true;
-  var unionSize = 0;
-  for (var _ in union) unionSize++;
+  var unionSize = Object.keys(union).length;
   return inter / unionSize;
 }
 
 function qualityFromText(text) {
   if (!text) return "Unknown";
-  var t = text.toUpperCase();
-  if (t.indexOf("2160") !== -1 || t.indexOf("4K") !== -1) return "4K";
-  if (t.indexOf("1080") !== -1) return "1080p";
-  if (t.indexOf("720") !== -1) return "720p";
-  if (t.indexOf("480") !== -1) return "480p";
+  var t = String(text);
+  // Word boundaries avoid false positives (e.g. "4Kids", digits inside larger numbers)
+  if (/\b2160\b|\b4K\b/i.test(t)) return "4K";
+  if (/\b1080\b/i.test(t)) return "1080p";
+  if (/\b720\b/i.test(t)) return "720p";
+  if (/\b480\b/i.test(t)) return "480p";
   return "Unknown";
 }
 
@@ -107,12 +116,96 @@ function getCheerio() {
   }
 }
 
+function normalizeMediaType(mediaType) {
+  if (mediaType === "series" || mediaType === "tv") return "tv";
+  return "movie";
+}
+
+/** fetch with AbortController timeout so one hung mirror does not block everything */
+function fetchWithTimeout(url, options, timeoutMs) {
+  timeoutMs = timeoutMs || FETCH_TIMEOUT_MS;
+  var controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  var timer = null;
+  var opts = Object.assign({}, options || {});
+  if (controller) {
+    opts.signal = controller.signal;
+    timer = setTimeout(function () {
+      try { controller.abort(); } catch (e) {}
+    }, timeoutMs);
+  }
+  return fetch(url, opts).then(
+    function (res) {
+      if (timer) clearTimeout(timer);
+      return res;
+    },
+    function (err) {
+      if (timer) clearTimeout(timer);
+      throw err;
+    }
+  );
+}
+
+/** simple concurrency-limited map */
+function mapLimit(items, limit, iterator) {
+  return __async(this, null, function* () {
+    var results = new Array(items.length);
+    var idx = 0;
+    function worker() {
+      return __async(this, null, function* () {
+        while (idx < items.length) {
+          var i = idx++;
+          try {
+            results[i] = yield iterator(items[i], i);
+          } catch (e) {
+            results[i] = e;
+          }
+        }
+      });
+    }
+    var workers = [];
+    var n = Math.min(limit, items.length) || 1;
+    for (var w = 0; w < n; w++) workers.push(worker());
+    yield Promise.all(workers);
+    return results;
+  });
+}
+
+function matchesEpisode(text, episode) {
+  if (!episode && episode !== 0) return true;
+  if (!text) return false;
+  var lower = String(text).toLowerCase();
+  var ep = String(episode);
+  var epPad = ep.padStart(2, "0");
+  // e01, e1, episode 1, ep 01, x01 style
+  var re = new RegExp(
+    "\\b(?:e|ep|episode)\\s*0*" + ep + "\\b|\\be0*" + epPad + "\\b|\\bx0*" + ep + "\\b",
+    "i"
+  );
+  return re.test(lower);
+}
+
+function matchesSeason(text, season) {
+  if (!season && season !== 0) return true;
+  if (!text) return false;
+  var lower = String(text).toLowerCase();
+  var s = String(season);
+  // word-boundary so s1 does not match s10 / s12 / boss1
+  var re = new RegExp(
+    "\\b(?:season\\s*0*" + s + "|s\\s*0*" + s + ")\\b",
+    "i"
+  );
+  return re.test(lower);
+}
+
 // ─── TMDB ────────────────────────────────────────────────────────────────────
 function getTMDBDetails(tmdbId, mediaType) {
   return __async(this, null, function* () {
-    var endpoint = mediaType === "tv" || mediaType === "series" ? "tv" : "movie";
+    if (!TMDB_API_KEY) {
+      throw new Error("TMDB_API_KEY not set (use process.env.TMDB_API_KEY)");
+    }
+    var endpoint = normalizeMediaType(mediaType) === "tv" ? "tv" : "movie";
     var url = TMDB_BASE + "/" + endpoint + "/" + tmdbId + "?api_key=" + TMDB_API_KEY + "&append_to_response=external_ids";
-    var res = yield fetch(url, {
+    var res = yield fetchWithTimeout(url, {
       headers: { Accept: "application/json", "User-Agent": HEADERS["User-Agent"] }
     });
     if (!res.ok) throw new Error("TMDB " + res.status);
@@ -134,7 +227,7 @@ function searchPosts(query) {
         "?q=" + encodeURIComponent(query) +
         "&query_by=post_title,category&query_by_weights=4,2&sort_by=sort_by_date:desc&limit=20&highlight_fields=none&use_cache=true&page=1&analytics_tag=" + today;
 
-      var apiRes = yield fetch(apiUrl, { headers: HEADERS });
+      var apiRes = yield fetchWithTimeout(apiUrl, { headers: HEADERS });
       if (apiRes.ok) {
         var data = yield apiRes.json();
         if (data && data.hits && data.hits.length) {
@@ -173,7 +266,7 @@ function searchPostsHtml(query) {
       console.log("[HDHub4u] HTML search:", searchUrl);
 
       try {
-        var res = yield fetch(searchUrl, {
+        var res = yield fetchWithTimeout(searchUrl, {
           headers: Object.assign({}, HEADERS, { Referer: base + "/" }),
           redirect: "follow"
         });
@@ -251,6 +344,7 @@ function findBestMatch(mediaInfo, results, mediaType, season) {
   if (!results || !results.length) return null;
   var best = null;
   var bestScore = 0;
+  var type = normalizeMediaType(mediaType);
 
   for (var i = 0; i < results.length; i++) {
     var r = results[i];
@@ -263,18 +357,12 @@ function findBestMatch(mediaInfo, results, mediaType, season) {
       else if (diff > 3) score -= 0.3;
     }
 
-    if ((mediaType === "tv" || mediaType === "series") && season) {
-      var lower = (r.title || "").toLowerCase();
-      var hasSeason =
-        lower.indexOf("season " + season) !== -1 ||
-        lower.indexOf("s" + season) !== -1 ||
-        lower.indexOf("season " + String(season).padStart(2, "0")) !== -1 ||
-        lower.indexOf("s" + String(season).padStart(2, "0")) !== -1;
-      if (hasSeason) score += 0.4;
+    if (type === "tv" && season) {
+      if (matchesSeason(r.title, season)) score += 0.4;
       else score -= 0.25;
     }
 
-    if (score > bestScore && score > 0.35) {
+    if (score > bestScore && score > MATCH_SCORE_THRESHOLD) {
       bestScore = score;
       best = r;
     }
@@ -346,7 +434,7 @@ function resolveHubCloud(url, referer) {
       var currentUrl = url.replace("hubcloud.ink", "hubcloud.dad");
       console.log("[HDHub4u] Resolving HubCloud:", currentUrl);
 
-      var res = yield fetch(currentUrl, {
+      var res = yield fetchWithTimeout(currentUrl, {
         headers: Object.assign({}, HEADERS, { Referer: referer || currentBase + "/" }),
         redirect: "follow"
       });
@@ -375,7 +463,7 @@ function resolveHubCloud(url, referer) {
             }
           }
           console.log("[HDHub4u] HubCloud next hop:", nextHref);
-          var res2 = yield fetch(nextHref, {
+          var res2 = yield fetchWithTimeout(nextHref, {
             headers: Object.assign({}, HEADERS, { Referer: finalUrl }),
             redirect: "follow"
           });
@@ -474,7 +562,7 @@ function resolveLink(url, referer) {
 
     // Simple redirect follow for other intermediate hosts
     try {
-      var res = yield fetch(url, {
+      var res = yield fetchWithTimeout(url, {
         headers: Object.assign({}, HEADERS, { Referer: referer || currentBase + "/" }),
         redirect: "follow"
       });
@@ -518,7 +606,7 @@ function getStreams(tmdbId, mediaType, season, episode) {
     try {
       if (!tmdbId) return [];
 
-      var type = mediaType === "series" ? "tv" : (mediaType || "movie");
+      var type = normalizeMediaType(mediaType);
       var mediaInfo = yield getTMDBDetails(tmdbId, type);
 
       console.log("[HDHub4u] TMDB:", mediaInfo.title, mediaInfo.year || "?", "type:", type, "S" + (season || "-") + "E" + (episode || "-"));
@@ -547,7 +635,7 @@ function getStreams(tmdbId, mediaType, season, episode) {
         pageUrl = currentBase + (pageUrl.charAt(0) === "/" ? pageUrl : "/" + pageUrl);
       }
 
-      var pageRes = yield fetch(pageUrl, {
+      var pageRes = yield fetchWithTimeout(pageUrl, {
         headers: Object.assign({}, HEADERS, { Referer: currentBase + "/" })
       });
 
@@ -555,9 +643,13 @@ function getStreams(tmdbId, mediaType, season, episode) {
         for (var mi = 0; mi < Math.min(MIRRORS.length, 5); mi++) {
           var tryBase = MIRRORS[mi];
           var altUrl = pageUrl.replace(/https?:\/\/[^/]+/, tryBase);
-          pageRes = yield fetch(altUrl, {
-            headers: Object.assign({}, HEADERS, { Referer: tryBase + "/" })
-          });
+          try {
+            pageRes = yield fetchWithTimeout(altUrl, {
+              headers: Object.assign({}, HEADERS, { Referer: tryBase + "/" })
+            });
+          } catch (e) {
+            continue;
+          }
           if (pageRes.ok) {
             pageUrl = altUrl;
             currentBase = tryBase;
@@ -577,27 +669,48 @@ function getStreams(tmdbId, mediaType, season, episode) {
         return [];
       }
 
+      // Prefer links that mention the requested episode (when provided)
+      if (type === "tv" && (episode || episode === 0)) {
+        var epFiltered = rawLinks.filter(function (L) {
+          return matchesEpisode(L.name, episode) || matchesEpisode(L.url, episode);
+        });
+        if (epFiltered.length) {
+          console.log("[HDHub4u] Episode filter kept", epFiltered.length, "of", rawLinks.length);
+          rawLinks = epFiltered;
+        } else {
+          console.log("[HDHub4u] No episode-specific links; using all", rawLinks.length);
+        }
+      }
+
       var streams = [];
       var seenFinal = {};
 
-      for (var i = 0; i < rawLinks.length; i++) {
-        var L = rawLinks[i];
-        try {
-          var resolved = yield resolveLink(L.url, pageUrl);
-          for (var j = 0; j < resolved.length; j++) {
-            var R = resolved[j];
-            if (!R.url || seenFinal[R.url]) continue;
-            seenFinal[R.url] = true;
-
-            streams.push(buildStreamObject({
-              url: R.url,
-              name: R.name || L.name,
-              quality: R.quality !== "Unknown" ? R.quality : L.quality,
-              size: R.size || L.size
-            }, mediaInfo));
-          }
-        } catch (e) {
+      // Parallel resolve with limited concurrency (avoids sequential slowness)
+      var resolvedBatches = yield mapLimit(rawLinks, RESOLVE_CONCURRENCY, function (L) {
+        return resolveLink(L.url, pageUrl).then(function (resolved) {
+          return { L: L, resolved: resolved };
+        }).catch(function (e) {
           console.log("[HDHub4u] resolve error:", e && e.message ? e.message : e);
+          return { L: L, resolved: [] };
+        });
+      });
+
+      for (var bi = 0; bi < resolvedBatches.length; bi++) {
+        var batch = resolvedBatches[bi];
+        if (!batch || !batch.resolved) continue;
+        var L = batch.L;
+        var resolved = batch.resolved;
+        for (var j = 0; j < resolved.length; j++) {
+          var R = resolved[j];
+          if (!R.url || seenFinal[R.url]) continue;
+          seenFinal[R.url] = true;
+
+          streams.push(buildStreamObject({
+            url: R.url,
+            name: R.name || L.name,
+            quality: R.quality !== "Unknown" ? R.quality : L.quality,
+            size: R.size || L.size
+          }, mediaInfo));
         }
       }
 
