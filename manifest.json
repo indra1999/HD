@@ -1,14 +1,14 @@
 {
   "name": "HDHub4u",
-  "version": "1.3.0",
-  "description": "HDHub4u streams - HubCloud/FilesDL resolver + HTML search fallback",
+  "version": "1.2.0",
+  "description": "HDHub4u streams - HubCloud resolver + HTML search fallback",
   "author": "Custom",
   "scrapers": [
     {
       "id": "hdhub4u",
       "name": "HDHub4u",
-      "description": "Movies & Series from HDHub4u (HubCloud/FilesDL resolved, dual audio)",
-      "version": "1.3.0",
+      "description": "Movies & Series from HDHub4u (HubCloud resolved, dual audio)",
+      "version": "1.2.0",
       "author": "Custom",
       "supportedTypes": [
         "movie",
