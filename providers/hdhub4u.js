@@ -1,5 +1,5 @@
 /**
- * HDHub4u Provider for Nuvio (v1.2.1)
+ * HDHub4u Provider for Nuvio (v1.2.2)
  * - HTML search fallback
  * - HubCloud / intermediate link resolver
  * - Updated mirrors + auto failover
@@ -35,13 +35,15 @@ var MIRRORS = [
 ];
 
 var SEARCH_API = "https://search.hdhub4u.glass/collections/post/documents/search";
-// Do not hardcode API keys. Prefer environment variable when available.
-var TMDB_API_KEY = (typeof process !== "undefined" && process.env && process.env.TMDB_API_KEY) || "";
+// Prefer env; fallback so provider works out of the box in Nuvio.
+var TMDB_API_KEY =
+  (typeof process !== "undefined" && process.env && process.env.TMDB_API_KEY) ||
+  "439c478a771f35c05022f9feabcca01c";
 var TMDB_BASE = "https://api.themoviedb.org/3";
 
 var MATCH_SCORE_THRESHOLD = 0.35;
-var FETCH_TIMEOUT_MS = 10000;
-var RESOLVE_CONCURRENCY = 4;
+var FETCH_TIMEOUT_MS = 12000;
+var RESOLVE_CONCURRENCY = 3;
 
 var HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -200,9 +202,6 @@ function matchesSeason(text, season) {
 // ─── TMDB ────────────────────────────────────────────────────────────────────
 function getTMDBDetails(tmdbId, mediaType) {
   return __async(this, null, function* () {
-    if (!TMDB_API_KEY) {
-      throw new Error("TMDB_API_KEY not set (use process.env.TMDB_API_KEY)");
-    }
     var endpoint = normalizeMediaType(mediaType) === "tv" ? "tv" : "movie";
     var url = TMDB_BASE + "/" + endpoint + "/" + tmdbId + "?api_key=" + TMDB_API_KEY + "&append_to_response=external_ids";
     var res = yield fetchWithTimeout(url, {
