@@ -1,11 +1,9 @@
 /**
- * HDHub4u Provider for Nuvio (v1.2.2)
- * - HTML search fallback
- * - HubCloud / intermediate link resolver
- * - Updated mirrors + auto failover
- * - Fixes: normalizeTitle order/Unicode, season boundary match, episode filter,
- *   fetch timeout, parallel resolve, quality word-boundary, score threshold config,
- *   mediaType normalize, safer TMDB key handling
+ * HDHub4u Provider for Nuvio (v1.3.0)
+ * - Updated working mirrors (2hdhub4u.today etc.)
+ * - filesdl.live intermediate resolver
+ * - Promise.race timeouts (works without AbortController)
+ * - HTML search + Typesense fallback
  * Exports: getStreams(tmdbId, mediaType, season, episode)
  */
 
@@ -24,26 +22,24 @@ var __async = (thisArg, args, generator) => {
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 var MIRRORS = [
+  "https://2hdhub4u.today",
+  "https://hdhub4u.deal",
   "https://new11.hdhub4u.cl",
   "https://new10.hdhub4u.cl",
   "https://new9.hdhub4u.cl",
-  "https://new8.hdhub4u.cl",
-  "https://new6.hdhub4u.fo",
-  "https://new5.hdhub4u.fo",
-  "https://hdhub4u.fo",
-  "https://hdhub4u13.com"
+  "https://hdhub4u.fo"
 ];
 
 var SEARCH_API = "https://search.hdhub4u.glass/collections/post/documents/search";
-// Prefer env; fallback so provider works out of the box in Nuvio.
 var TMDB_API_KEY =
   (typeof process !== "undefined" && process.env && process.env.TMDB_API_KEY) ||
   "439c478a771f35c05022f9feabcca01c";
 var TMDB_BASE = "https://api.themoviedb.org/3";
 
-var MATCH_SCORE_THRESHOLD = 0.35;
-var FETCH_TIMEOUT_MS = 12000;
+var MATCH_SCORE_THRESHOLD = 0.30;
+var FETCH_TIMEOUT_MS = 10000;
 var RESOLVE_CONCURRENCY = 3;
+var TOTAL_BUDGET_MS = 45000;
 
 var HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -61,11 +57,9 @@ var currentBase = MIRRORS[0];
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 function normalizeTitle(t) {
   if (!t) return "";
-  // Order: strip articles → punctuation → collapse whitespace last
-  // Avoid [^\w\s] which drops non-Latin scripts (Bengali, Hindi, etc.)
   return t.toLowerCase()
     .replace(/\b(the|a|an)\b/g, "")
-    .replace(/[:\-_'`~!@#$%^&*()+=\[\]{};:"\\|,.<>\/?]+/g, " ")
+    .replace(/[:\-_'\`~!@#$%^&*()+=\[\]{};:"\\|,.<>\/?]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -84,14 +78,12 @@ function titleSimilarity(a, b) {
   var union = {};
   for (var k = 0; k < w1.length; k++) union[w1[k]] = true;
   for (var m = 0; m < w2.length; m++) union[w2[m]] = true;
-  var unionSize = Object.keys(union).length;
-  return inter / unionSize;
+  return inter / Object.keys(union).length;
 }
 
 function qualityFromText(text) {
   if (!text) return "Unknown";
   var t = String(text);
-  // Word boundaries avoid false positives (e.g. "4Kids", digits inside larger numbers)
   if (/\b2160\b|\b4K\b/i.test(t)) return "4K";
   if (/\b1080\b/i.test(t)) return "1080p";
   if (/\b720\b/i.test(t)) return "720p";
@@ -123,31 +115,44 @@ function normalizeMediaType(mediaType) {
   return "movie";
 }
 
-/** fetch with AbortController timeout so one hung mirror does not block everything */
+/** Timeout that works even when AbortController is missing / ignored */
 function fetchWithTimeout(url, options, timeoutMs) {
   timeoutMs = timeoutMs || FETCH_TIMEOUT_MS;
   var controller = typeof AbortController !== "undefined" ? new AbortController() : null;
-  var timer = null;
   var opts = Object.assign({}, options || {});
-  if (controller) {
-    opts.signal = controller.signal;
-    timer = setTimeout(function () {
-      try { controller.abort(); } catch (e) {}
-    }, timeoutMs);
-  }
-  return fetch(url, opts).then(
+  if (controller) opts.signal = controller.signal;
+
+  var timedOut = false;
+  var timer = setTimeout(function () {
+    timedOut = true;
+    try { if (controller) controller.abort(); } catch (e) {}
+  }, timeoutMs);
+
+  var fetchPromise = fetch(url, opts).then(
     function (res) {
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
       return res;
     },
     function (err) {
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
       throw err;
     }
   );
+
+  var timeoutPromise = new Promise(function (_, reject) {
+    setTimeout(function () {
+      reject(new Error("timeout " + timeoutMs + "ms: " + url));
+    }, timeoutMs + 50);
+  });
+
+  return Promise.race([fetchPromise, timeoutPromise]).catch(function (err) {
+    if (timedOut || (err && /timeout|aborted|AbortError/i.test(String(err.message || err)))) {
+      throw new Error("timeout " + timeoutMs + "ms");
+    }
+    throw err;
+  });
 }
 
-/** simple concurrency-limited map */
 function mapLimit(items, limit, iterator) {
   return __async(this, null, function* () {
     var results = new Array(items.length);
@@ -165,7 +170,7 @@ function mapLimit(items, limit, iterator) {
       });
     }
     var workers = [];
-    var n = Math.min(limit, items.length) || 1;
+    var n = Math.min(limit || 1, items.length) || 1;
     for (var w = 0; w < n; w++) workers.push(worker());
     yield Promise.all(workers);
     return results;
@@ -173,30 +178,34 @@ function mapLimit(items, limit, iterator) {
 }
 
 function matchesEpisode(text, episode) {
-  if (!episode && episode !== 0) return true;
+  if (episode === undefined || episode === null || episode === "") return true;
   if (!text) return false;
-  var lower = String(text).toLowerCase();
   var ep = String(episode);
-  var epPad = ep.padStart(2, "0");
-  // e01, e1, episode 1, ep 01, x01 style
   var re = new RegExp(
-    "\\b(?:e|ep|episode)\\s*0*" + ep + "\\b|\\be0*" + epPad + "\\b|\\bx0*" + ep + "\\b",
+    "\\b(?:e|ep|episode)\\s*0*" + ep + "\\b|\\be0*" + ep.padStart(2, "0") + "\\b",
     "i"
   );
-  return re.test(lower);
+  return re.test(String(text));
 }
 
 function matchesSeason(text, season) {
-  if (!season && season !== 0) return true;
+  if (season === undefined || season === null || season === "") return true;
   if (!text) return false;
-  var lower = String(text).toLowerCase();
   var s = String(season);
-  // word-boundary so s1 does not match s10 / s12 / boss1
-  var re = new RegExp(
-    "\\b(?:season\\s*0*" + s + "|s\\s*0*" + s + ")\\b",
-    "i"
+  var re = new RegExp("\\b(?:season\\s*0*" + s + "|s\\s*0*" + s + ")\\b", "i");
+  return re.test(String(text));
+}
+
+function isChallengeHtml(html) {
+  if (!html || html.length < 500) return true;
+  var h = html.toLowerCase();
+  return (
+    h.indexOf("cf-browser-verification") !== -1 ||
+    h.indexOf("challenge-platform") !== -1 ||
+    h.indexOf("just a moment") !== -1 ||
+    h.indexOf("attention required") !== -1 ||
+    h.indexOf("cf-chl") !== -1
   );
-  return re.test(lower);
 }
 
 // ─── TMDB ────────────────────────────────────────────────────────────────────
@@ -206,7 +215,7 @@ function getTMDBDetails(tmdbId, mediaType) {
     var url = TMDB_BASE + "/" + endpoint + "/" + tmdbId + "?api_key=" + TMDB_API_KEY + "&append_to_response=external_ids";
     var res = yield fetchWithTimeout(url, {
       headers: { Accept: "application/json", "User-Agent": HEADERS["User-Agent"] }
-    });
+    }, 8000);
     if (!res.ok) throw new Error("TMDB " + res.status);
     var data = yield res.json();
     var title = endpoint === "tv" ? data.name : data.title;
@@ -226,7 +235,7 @@ function searchPosts(query) {
         "?q=" + encodeURIComponent(query) +
         "&query_by=post_title,category&query_by_weights=4,2&sort_by=sort_by_date:desc&limit=20&highlight_fields=none&use_cache=true&page=1&analytics_tag=" + today;
 
-      var apiRes = yield fetchWithTimeout(apiUrl, { headers: HEADERS });
+      var apiRes = yield fetchWithTimeout(apiUrl, { headers: HEADERS }, 6000);
       if (apiRes.ok) {
         var data = yield apiRes.json();
         if (data && data.hits && data.hits.length) {
@@ -268,16 +277,11 @@ function searchPostsHtml(query) {
         var res = yield fetchWithTimeout(searchUrl, {
           headers: Object.assign({}, HEADERS, { Referer: base + "/" }),
           redirect: "follow"
-        });
+        }, 8000);
         if (!res.ok) continue;
 
         var html = yield res.text();
-        if (
-          html.indexOf("cf-browser-verification") !== -1 ||
-          html.indexOf("challenge-platform") !== -1 ||
-          html.indexOf("Just a moment") !== -1 ||
-          html.length < 2000
-        ) {
+        if (isChallengeHtml(html)) {
           console.log("[HDHub4u] Challenge page on", base);
           continue;
         }
@@ -289,15 +293,18 @@ function searchPostsHtml(query) {
           "article h2 a, article h3 a",
           ".post-title a, .entry-title a",
           "h2.entry-title a, h3.entry-title a",
+          "h1 a, h2 a, h3 a",
           ".thumb a, .thumbnail a, figure a",
+          "a[href*='.html']",
           "a[href*='/']"
         ];
 
-        for (var s = 0; s < selectors.length && results.length < 15; s++) {
+        for (var s = 0; s < selectors.length && results.length < 20; s++) {
           $(selectors[s]).each(function (i, el) {
-            if (results.length >= 15) return;
+            if (results.length >= 20) return;
             var href = $(el).attr("href");
             var text = ($(el).text() || $(el).attr("title") || "").trim();
+            text = text.replace(/\s+/g, " ");
             if (!href || !text || text.length < 4) return;
             if (href.indexOf("javascript:") === 0) return;
             if (seen[href]) return;
@@ -307,14 +314,18 @@ function searchPostsHtml(query) {
               lowerHref.indexOf("/category/") !== -1 ||
               lowerHref.indexOf("/tag/") !== -1 ||
               lowerHref.indexOf("/page/") !== -1 ||
+              lowerHref.indexOf("/search/") !== -1 ||
               lowerHref.indexOf("wp-") !== -1 ||
+              lowerHref.indexOf("feed") !== -1 ||
+              lowerHref.indexOf("download-tips") !== -1 ||
               lowerHref === base + "/" ||
               lowerHref === base
             ) return;
 
             var looksLikeContent =
               /\b(20\d{2}|19\d{2})\b/.test(text) ||
-              /season|s\d{1,2}|episode|dual|audio|web-dl|bluray|hdrip|1080|720|480|4k/i.test(text);
+              /season|s\d{1,2}|episode|dual|audio|web-dl|bluray|hdrip|1080|720|480|4k|full movie|hindi/i.test(text) ||
+              /\.html/i.test(href);
 
             if (!looksLikeContent && s < selectors.length - 1) return;
 
@@ -378,29 +389,30 @@ function extractPageLinks(html, pageUrl) {
   var links = [];
   var seen = {};
 
-  $("h3 a, h4 a, h2 a, .page-body a, .entry-content a, .post-content a, a").each(function (i, el) {
+  $("a[href]").each(function (i, el) {
     var href = $(el).attr("href");
-    var text = ($(el).text() || "").trim();
+    var text = ($(el).text() || "").replace(/\s+/g, " ").trim();
     if (!href) return;
     if (href.indexOf("javascript:") === 0) return;
 
     var lower = href.toLowerCase();
     var isCandidate =
+      lower.indexOf("filesdl") !== -1 ||
       lower.indexOf("hdstream") !== -1 ||
       lower.indexOf("hubcloud") !== -1 ||
       lower.indexOf("hubstream") !== -1 ||
       lower.indexOf("hblinks") !== -1 ||
       lower.indexOf("hubcdn") !== -1 ||
+      lower.indexOf("mkvcdn") !== -1 ||
       lower.indexOf("pixeldrain") !== -1 ||
       lower.indexOf("gofile") !== -1 ||
-      lower.indexOf("drive") !== -1 ||
+      lower.indexOf("gdflix") !== -1 ||
+      lower.indexOf("vcloud") !== -1 ||
       lower.indexOf("workers.dev") !== -1 ||
       lower.indexOf("r2.dev") !== -1 ||
-      /480|720|1080|2160|4k/i.test(text);
+      (/480|720|1080|2160|4k/i.test(text) && /download/i.test(text));
 
     if (!isCandidate) return;
-    if (seen[href]) return;
-    seen[href] = true;
 
     var abs = href;
     if (href.indexOf("http") !== 0) {
@@ -411,10 +423,15 @@ function extractPageLinks(html, pageUrl) {
       }
     }
 
+    var q = qualityFromText(text);
+    var key = abs + "|" + q;
+    if (seen[key]) return;
+    seen[key] = true;
+
     links.push({
       url: abs,
       name: text || "Download",
-      quality: qualityFromText(text),
+      quality: q,
       size: sizeFromText(text)
     });
   });
@@ -423,11 +440,90 @@ function extractPageLinks(html, pageUrl) {
   return links;
 }
 
-// ─── HubCloud Resolver (core fix) ────────────────────────────────────────────
-function resolveHubCloud(url, referer) {
+// ─── Intermediate resolvers ──────────────────────────────────────────────────
+function resolveFilesdl(url, referer) {
   return __async(this, null, function* () {
     var cheerio = getCheerio();
     if (!cheerio) return [];
+
+    try {
+      console.log("[HDHub4u] Resolving filesdl:", url);
+      var res = yield fetchWithTimeout(url, {
+        headers: Object.assign({}, HEADERS, { Referer: referer || currentBase + "/" }),
+        redirect: "follow"
+      }, 10000);
+      var html = yield res.text();
+      if (isChallengeHtml(html)) {
+        console.log("[HDHub4u] filesdl challenge");
+        return [{ url: url, name: "FilesDL", quality: "Unknown", size: null }];
+      }
+
+      var $ = cheerio.load(html);
+      var results = [];
+      var seen = {};
+
+      $("a[href]").each(function (i, el) {
+        var link = $(el).attr("href");
+        var text = ($(el).text() || "").replace(/\s+/g, " ").trim();
+        if (!link || seen[link]) return;
+
+        var lower = link.toLowerCase();
+        var label = text.toUpperCase();
+        var isUseful =
+          label.indexOf("HUBCLOUD") !== -1 ||
+          label.indexOf("GDFLIX") !== -1 ||
+          label.indexOf("VCLOUD") !== -1 ||
+          label.indexOf("DOWNLOAD") !== -1 ||
+          lower.indexOf("hubcloud") !== -1 ||
+          lower.indexOf("mkvcdn") !== -1 ||
+          lower.indexOf("gdflix") !== -1 ||
+          lower.indexOf("filesdl.co") !== -1 ||
+          lower.indexOf("workers.dev") !== -1 ||
+          lower.indexOf("r2.dev") !== -1 ||
+          lower.indexOf("pixeldrain") !== -1 ||
+          lower.indexOf("gofile") !== -1 ||
+          /\.(mkv|mp4|avi|m3u8)(\?|$)/i.test(link);
+
+        if (!isUseful) return;
+        if (link.indexOf("javascript:") === 0) return;
+        seen[link] = true;
+
+        var absLink = link;
+        if (link.indexOf("http") !== 0) {
+          try { absLink = new URL(link, url).href; } catch (e) { absLink = link; }
+        }
+
+        var hostLabel = "FilesDL";
+        if (/hubcloud|mkvcdn/i.test(label + absLink)) hostLabel = "HubCloud";
+        else if (/gdflix/i.test(label + absLink)) hostLabel = "GDFlix";
+        else if (/vcloud|filesdl\.co/i.test(label + absLink)) hostLabel = "VCloud";
+        else if (/pixel/i.test(label + absLink)) hostLabel = "Pixeldrain";
+        else if (/gofile/i.test(label + absLink)) hostLabel = "Gofile";
+
+        results.push({
+          url: absLink,
+          name: hostLabel + (text ? " • " + text.slice(0, 30) : ""),
+          quality: qualityFromText(text),
+          size: sizeFromText(text)
+        });
+      });
+
+      console.log("[HDHub4u] filesdl resolved:", results.length);
+      if (!results.length) {
+        return [{ url: url, name: "FilesDL", quality: "Unknown", size: null }];
+      }
+      return results;
+    } catch (err) {
+      console.log("[HDHub4u] filesdl error:", err && err.message ? err.message : err);
+      return [{ url: url, name: "FilesDL", quality: "Unknown", size: null }];
+    }
+  });
+}
+
+function resolveHubCloud(url, referer) {
+  return __async(this, null, function* () {
+    var cheerio = getCheerio();
+    if (!cheerio) return [{ url: url, name: "HubCloud", quality: "Unknown", size: null }];
 
     try {
       var currentUrl = url.replace("hubcloud.ink", "hubcloud.dad");
@@ -436,36 +532,31 @@ function resolveHubCloud(url, referer) {
       var res = yield fetchWithTimeout(currentUrl, {
         headers: Object.assign({}, HEADERS, { Referer: referer || currentBase + "/" }),
         redirect: "follow"
-      });
+      }, 10000);
       var html = yield res.text();
       var finalUrl = res.url || currentUrl;
 
-      // Step 1: if not already on hubcloud.php, find next hop
+      if (isChallengeHtml(html)) {
+        return [{ url: currentUrl, name: "HubCloud", quality: "Unknown", size: null }];
+      }
+
       if (finalUrl.indexOf("hubcloud.php") === -1 && html.indexOf("hubcloud.php") === -1) {
         var $1 = cheerio.load(html);
-        var nextHref = "";
-
-        var downloadBtn = $1("#download").attr("href") || $1("a#download").attr("href");
-        if (downloadBtn) {
-          nextHref = downloadBtn;
-        } else {
+        var nextHref = $1("#download").attr("href") || $1("a#download").attr("href") || "";
+        if (!nextHref) {
           var scriptMatch = html.match(/var\s+url\s*=\s*['"]([^'"]+)['"]/);
           if (scriptMatch) nextHref = scriptMatch[1];
         }
-
         if (nextHref) {
           if (nextHref.indexOf("http") !== 0) {
-            try {
-              nextHref = new URL(nextHref, finalUrl).href;
-            } catch (e) {
+            try { nextHref = new URL(nextHref, finalUrl).href; } catch (e) {
               nextHref = finalUrl.replace(/\/[^/]*$/, "/") + nextHref.replace(/^\//, "");
             }
           }
-          console.log("[HDHub4u] HubCloud next hop:", nextHref);
           var res2 = yield fetchWithTimeout(nextHref, {
             headers: Object.assign({}, HEADERS, { Referer: finalUrl }),
             redirect: "follow"
-          });
+          }, 10000);
           html = yield res2.text();
           finalUrl = res2.url || nextHref;
         }
@@ -484,8 +575,6 @@ function resolveHubCloud(url, referer) {
         var link = $(el).attr("href");
         var text = ($(el).text() || "").toLowerCase().trim();
         if (!link || seen[link]) return;
-
-        // Skip non-useful links
         if (link.indexOf("javascript:") === 0) return;
         if (link === "#" || link.indexOf("telegram") !== -1 || link.indexOf("whatsapp") !== -1) return;
 
@@ -498,12 +587,10 @@ function resolveHubCloud(url, referer) {
           text.indexOf("mega") !== -1 ||
           text.indexOf("pixel") !== -1 ||
           text.indexOf("gofile") !== -1 ||
-          text.indexOf("zipdisk") !== -1 ||
           link.indexOf("workers.dev") !== -1 ||
           link.indexOf("r2.dev") !== -1 ||
           link.indexOf("pixeldrain") !== -1 ||
           link.indexOf("gofile") !== -1 ||
-          link.indexOf("hubcloud") !== -1 ||
           /\.(mkv|mp4|avi|m3u8)(\?|$)/i.test(link);
 
         if (!isUseful) return;
@@ -511,19 +598,12 @@ function resolveHubCloud(url, referer) {
 
         var absLink = link;
         if (link.indexOf("http") !== 0) {
-          try {
-            absLink = new URL(link, finalUrl).href;
-          } catch (e) {
-            absLink = link;
-          }
+          try { absLink = new URL(link, finalUrl).href; } catch (e) { absLink = link; }
         }
 
         var label = "HubCloud";
         if (text.indexOf("fsl") !== -1) label = "HubCloud FSL";
         else if (text.indexOf("s3") !== -1) label = "HubCloud S3";
-        else if (text.indexOf("buzz") !== -1) label = "HubCloud Buzz";
-        else if (text.indexOf("10gbps") !== -1) label = "HubCloud 10Gbps";
-        else if (text.indexOf("mega") !== -1) label = "HubCloud Mega";
         else if (text.indexOf("pixel") !== -1 || absLink.indexOf("pixeldrain") !== -1) label = "Pixeldrain";
         else if (text.indexOf("gofile") !== -1 || absLink.indexOf("gofile") !== -1) label = "Gofile";
         else if (absLink.indexOf("workers.dev") !== -1) label = "Workers";
@@ -536,11 +616,13 @@ function resolveHubCloud(url, referer) {
         });
       });
 
-      console.log("[HDHub4u] HubCloud resolved:", results.length, "links");
+      if (!results.length) {
+        return [{ url: finalUrl || url, name: "HubCloud", quality: quality, size: size }];
+      }
       return results;
     } catch (err) {
       console.log("[HDHub4u] HubCloud resolve error:", err && err.message ? err.message : err);
-      return [];
+      return [{ url: url, name: "HubCloud", quality: "Unknown", size: null }];
     }
   });
 }
@@ -549,28 +631,28 @@ function resolveLink(url, referer) {
   return __async(this, null, function* () {
     var lower = (url || "").toLowerCase();
 
-    // Already looks like direct file
     if (/\.(mkv|mp4|avi|m3u8)(\?|$)/i.test(url) || lower.indexOf("workers.dev") !== -1 || lower.indexOf("r2.dev") !== -1) {
       return [{ url: url, name: "Direct", quality: "Unknown", size: null }];
     }
 
-    // HubCloud family
-    if (lower.indexOf("hubcloud") !== -1 || lower.indexOf("hubcdn") !== -1) {
+    if (lower.indexOf("filesdl.live") !== -1 || lower.indexOf("filesdl.") !== -1) {
+      return yield resolveFilesdl(url, referer);
+    }
+
+    if (lower.indexOf("hubcloud") !== -1 || lower.indexOf("hubcdn") !== -1 || lower.indexOf("mkvcdn") !== -1) {
       return yield resolveHubCloud(url, referer);
     }
 
-    // Simple redirect follow for other intermediate hosts
     try {
       var res = yield fetchWithTimeout(url, {
         headers: Object.assign({}, HEADERS, { Referer: referer || currentBase + "/" }),
         redirect: "follow"
-      });
+      }, 10000);
       var final = res.url || url;
+      var fl = final.toLowerCase();
 
-      // If final is still intermediate, try HubCloud logic
-      if (final.toLowerCase().indexOf("hubcloud") !== -1) {
-        return yield resolveHubCloud(final, url);
-      }
+      if (fl.indexOf("filesdl") !== -1) return yield resolveFilesdl(final, url);
+      if (fl.indexOf("hubcloud") !== -1 || fl.indexOf("mkvcdn") !== -1) return yield resolveHubCloud(final, url);
 
       return [{ url: final, name: "Resolved", quality: "Unknown", size: null }];
     } catch (e) {
@@ -602,6 +684,7 @@ function buildStreamObject(link, mediaInfo) {
 // ─── Main entry ──────────────────────────────────────────────────────────────
 function getStreams(tmdbId, mediaType, season, episode) {
   return __async(this, null, function* () {
+    var started = Date.now();
     try {
       if (!tmdbId) return [];
 
@@ -616,6 +699,9 @@ function getStreams(tmdbId, mediaType, season, episode) {
       }
 
       var results = yield searchPosts(query);
+      if (!results.length && mediaInfo.year) {
+        results = yield searchPosts(mediaInfo.title + " " + mediaInfo.year);
+      }
       if (!results.length) {
         results = yield searchPosts(mediaInfo.title);
       }
@@ -629,46 +715,60 @@ function getStreams(tmdbId, mediaType, season, episode) {
       }
       console.log("[HDHub4u] Best match:", match.title, "→", match.url);
 
+      if (Date.now() - started > TOTAL_BUDGET_MS) {
+        console.log("[HDHub4u] Budget exceeded after search");
+        return [];
+      }
+
       var pageUrl = match.url;
       if (pageUrl.indexOf("http") !== 0) {
         pageUrl = currentBase + (pageUrl.charAt(0) === "/" ? pageUrl : "/" + pageUrl);
       }
 
-      var pageRes = yield fetchWithTimeout(pageUrl, {
-        headers: Object.assign({}, HEADERS, { Referer: currentBase + "/" })
-      });
+      var pageRes = null;
+      try {
+        pageRes = yield fetchWithTimeout(pageUrl, {
+          headers: Object.assign({}, HEADERS, { Referer: currentBase + "/" })
+        }, 10000);
+      } catch (e) {
+        pageRes = null;
+      }
 
-      if (!pageRes.ok) {
-        for (var mi = 0; mi < Math.min(MIRRORS.length, 5); mi++) {
+      if (!pageRes || !pageRes.ok) {
+        for (var mi = 0; mi < Math.min(MIRRORS.length, 4); mi++) {
           var tryBase = MIRRORS[mi];
           var altUrl = pageUrl.replace(/https?:\/\/[^/]+/, tryBase);
           try {
             pageRes = yield fetchWithTimeout(altUrl, {
               headers: Object.assign({}, HEADERS, { Referer: tryBase + "/" })
-            });
+            }, 8000);
           } catch (e) {
             continue;
           }
-          if (pageRes.ok) {
+          if (pageRes && pageRes.ok) {
             pageUrl = altUrl;
             currentBase = tryBase;
             break;
           }
         }
       }
-      if (!pageRes.ok) {
+      if (!pageRes || !pageRes.ok) {
         console.log("[HDHub4u] Page fetch failed");
         return [];
       }
 
       var html = yield pageRes.text();
+      if (isChallengeHtml(html)) {
+        console.log("[HDHub4u] Challenge on movie page");
+        return [];
+      }
+
       var rawLinks = extractPageLinks(html, pageUrl);
       if (!rawLinks.length) {
         console.log("[HDHub4u] No links on page");
         return [];
       }
 
-      // Prefer links that mention the requested episode (when provided)
       if (type === "tv" && (episode || episode === 0)) {
         var epFiltered = rawLinks.filter(function (L) {
           return matchesEpisode(L.name, episode) || matchesEpisode(L.url, episode);
@@ -676,16 +776,29 @@ function getStreams(tmdbId, mediaType, season, episode) {
         if (epFiltered.length) {
           console.log("[HDHub4u] Episode filter kept", epFiltered.length, "of", rawLinks.length);
           rawLinks = epFiltered;
-        } else {
-          console.log("[HDHub4u] No episode-specific links; using all", rawLinks.length);
         }
       }
+
+      rawLinks.sort(function (a, b) {
+        var score = function (L) {
+          var s = 0;
+          if (/filesdl/i.test(L.url)) s += 5;
+          if (L.quality && L.quality !== "Unknown") s += 3;
+          if (/download/i.test(L.name)) s += 1;
+          return s;
+        };
+        return score(b) - score(a);
+      });
+
+      rawLinks = rawLinks.slice(0, 12);
 
       var streams = [];
       var seenFinal = {};
 
-      // Parallel resolve with limited concurrency (avoids sequential slowness)
       var resolvedBatches = yield mapLimit(rawLinks, RESOLVE_CONCURRENCY, function (L) {
+        if (Date.now() - started > TOTAL_BUDGET_MS) {
+          return Promise.resolve({ L: L, resolved: [] });
+        }
         return resolveLink(L.url, pageUrl).then(function (resolved) {
           return { L: L, resolved: resolved };
         }).catch(function (e) {
@@ -707,7 +820,7 @@ function getStreams(tmdbId, mediaType, season, episode) {
           streams.push(buildStreamObject({
             url: R.url,
             name: R.name || L.name,
-            quality: R.quality !== "Unknown" ? R.quality : L.quality,
+            quality: (R.quality && R.quality !== "Unknown") ? R.quality : L.quality,
             size: R.size || L.size
           }, mediaInfo));
         }
@@ -718,7 +831,7 @@ function getStreams(tmdbId, mediaType, season, episode) {
         return (order[b.quality] || 0) - (order[a.quality] || 0);
       });
 
-      console.log("[HDHub4u] Returning", streams.length, "streams");
+      console.log("[HDHub4u] Returning", streams.length, "streams in", Date.now() - started, "ms");
       return streams;
     } catch (err) {
       console.log("[HDHub4u] error: " + (err && err.message ? err.message : err));
